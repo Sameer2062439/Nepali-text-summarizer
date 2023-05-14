@@ -1,99 +1,108 @@
-import time
-start = time.perf_counter()
-import tensorflow as tf
-import argparse
-import pickle
-import os
-from model import Model
-from utils import build_dict, build_dataset, batch_iter
+# -*- coding: utf-8 -*-
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from transformers import MT5Tokenizer
+import numpy as np
+import string
 
-# Uncomment next 2 lines to suppress error and Tensorflow info verbosity. Or change logging levels
-# tf.logging.set_verbosity(tf.logging.FATAL)
-# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# Read the data from CSV file
+from datasets import load_dataset, load_metric
 
-#To use GPU
-# config = tf.ConfigProto(device_count = {'GPU': 1})
-# with tf.Session(config=config) as sess:
+data = load_dataset("wisewizer/nepali-news", split="train")
 
-def add_arguments(parser):
-    parser.add_argument("--num_hidden", type=int, default=150, help="Network size.")
-    parser.add_argument("--num_layers", type=int, default=2, help="Network depth.")
-    parser.add_argument("--beam_width", type=int, default=10, help="Beam width for beam search decoder.")
-    parser.add_argument("--glove", action="store_true", help="Use glove as initial word embedding.")
-    parser.add_argument("--embedding_size", type=int, default=100, help="Word embedding size.")
+data = data.train_test_split(test_size=0.1)
 
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs.")
-    parser.add_argument("--keep_prob", type=float, default=0.8, help="Dropout keep prob.")
+def sentence_tokenize(text):
+    """This function tokenize the sentences
+    
+    Arguments:
+        text {string} -- Sentences you want to tokenize
+    
+    Returns:
+        sentence {list} -- tokenized sentence in list
+    """
+    sentences = text.strip().split(u"।")
+    sentences = [sentence.translate(str.maketrans('', '', string.punctuation)) for sentence in sentences]
+    return sentences
 
-    parser.add_argument("--toy", action="store_true", help="Use only 50K samples of data")
+checkpoint = "google/mt5-small"
+tokenizer = MT5Tokenizer.from_pretrained(checkpoint)
 
-    parser.add_argument("--with_model", action="store_true", help="Continue from previously saved model")
+prefix = "summarize: "
 
+def preprocess_function(examples):
+    inputs = [prefix + doc for doc in examples["text"]]
+    model_inputs = tokenizer(inputs, max_length=1024, truncation=True)
 
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(examples["summary"], max_length=128, truncation=True)
 
-parser = argparse.ArgumentParser()
-add_arguments(parser)
-args = parser.parse_args()
-with open("args.pickle", "wb") as f:
-    pickle.dump(args, f)
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
 
-if not os.path.exists("saved_model"):
-    os.mkdir("saved_model")
-else:
-    if args.with_model:
-        old_model_checkpoint_path = open('saved_model/checkpoint', 'r')
-        old_model_checkpoint_path = "".join(["saved_model/",old_model_checkpoint_path.read().splitlines()[0].split('"')[1] ])
+tokenized_data = data.map(preprocess_function, batched=True)
 
+from transformers import DataCollatorForSeq2Seq
 
-print("Building dictionary...")
-word_dict, reversed_dict, article_max_len, summary_max_len = build_dict("train", args.toy)
-print("Loading training dataset...")
-train_x, train_y = build_dataset("train", word_dict, article_max_len, summary_max_len, args.toy)
+data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=checkpoint)
 
+# import evaluate
 
-with tf.Session() as sess:
-    model = Model(reversed_dict, article_max_len, summary_max_len, args)
-    sess.run(tf.global_variables_initializer())
-    saver = tf.train.Saver(tf.global_variables())
-    if 'old_model_checkpoint_path' in globals():
-        print("Continuing from previous trained model:" , old_model_checkpoint_path , "...")
-        saver.restore(sess, old_model_checkpoint_path )
+# rouge = evaluate.load("rouge")
 
-    batches = batch_iter(train_x, train_y, args.batch_size, args.num_epochs)
-    num_batches_per_epoch = (len(train_x) - 1) // args.batch_size + 1
+# import numpy as np
 
-    print("\nIteration starts.")
-    print("Number of batches per epoch :", num_batches_per_epoch)
-    for batch_x, batch_y in batches:
-        batch_x_len = list(map(lambda x: len([y for y in x if y != 0]), batch_x))
-        batch_decoder_input = list(map(lambda x: [word_dict["<s>"]] + list(x), batch_y))
-        batch_decoder_len = list(map(lambda x: len([y for y in x if y != 0]), batch_decoder_input))
-        batch_decoder_output = list(map(lambda x: list(x) + [word_dict["</s>"]], batch_y))
+metric = load_metric("rouge")
 
-        batch_decoder_input = list(
-            map(lambda d: d + (summary_max_len - len(d)) * [word_dict["<padding>"]], batch_decoder_input))
-        batch_decoder_output = list(
-            map(lambda d: d + (summary_max_len - len(d)) * [word_dict["<padding>"]], batch_decoder_output))
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    # Replace -100 in the labels as we can't decode them.
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    
+    # Rouge expects a newline after each sentence
+    decoded_preds = ["\n".join(sentence_tokenize(pred.strip())) for pred in decoded_preds]
+    decoded_labels = ["\n".join(sentence_tokenize(label.strip())) for label in decoded_labels]
+    
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+    # Extract a few results
+    result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+    
+    # Add mean generated length
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in predictions]
+    result["gen_len"] = np.mean(prediction_lens)
+    
+    return {k: round(v, 4) for k, v in result.items()}
 
-        train_feed_dict = {
-            model.batch_size: len(batch_x),
-            model.X: batch_x,
-            model.X_len: batch_x_len,
-            model.decoder_input: batch_decoder_input,
-            model.decoder_len: batch_decoder_len,
-            model.decoder_target: batch_decoder_output
-        }
+from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer
 
-        _, step, loss = sess.run([model.update, model.global_step, model.loss], feed_dict=train_feed_dict)
+model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint)
 
-        if step % 1000 == 0:
-            print("step {0}: loss = {1}".format(step, loss))
+training_args = Seq2SeqTrainingArguments(
+    output_dir="nepali_sum_model",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5, #5e-5
+    save_steps=500,
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    weight_decay=0.01,
+    save_total_limit=2,
+    num_train_epochs=20,
+    predict_with_generate=True,
+    push_to_hub=False,
+    # load_best_model_at_end=True,
+    # metric_for_best_model="rouge2",
+)
 
-        if step % num_batches_per_epoch == 0:
-            hours, rem = divmod(time.perf_counter() - start, 3600)
-            minutes, seconds = divmod(rem, 60)
-            saver.save(sess, "./saved_model/model.ckpt", global_step=step)
-            print(" Epoch {0}: Model is saved.".format(step // num_batches_per_epoch),
-            "Elapsed: {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds) , "\n")
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_data["train"],
+    eval_dataset=tokenized_data["test"],
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
